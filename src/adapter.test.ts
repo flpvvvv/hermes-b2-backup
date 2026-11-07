@@ -78,6 +78,21 @@ describe("hermesAdapter include/exclude/sqlite patterns", () => {
       "home/profiles/work/logs/agent.log",
       "home/profiles/work/node/bin/node",
       "home/profiles/work/checkpoints/x",
+      // Per-platform toolchains and Hermes-managed binaries are re-downloadable.
+      "home/tools/ffmpeg-9.0.1-linux-x64/ffmpeg",
+      "home/tools/node-26.12.1-linux-x64/bin/node",
+      "home/tools/python-3.14.9-linux-x64/lib/python3.14/os.py",
+      "home/bin/uv",
+      "home/lsp/node_modules/typescript/lib/tsc.js",
+      "home/profiles/work/tools/node-26.12.1-linux-x64/bin/node",
+      // uv-managed venvs / package-manager runtimes.
+      "home/installs/13f0a2f8115124fd/environments/abc/bin/python",
+      "home/installs/13f0a2f8115124fd/pm-runtime/generations/1/x",
+      // Model metadata caches.
+      "home/models_dev_cache.json",
+      "home/provider_models_cache.json",
+      "home/profiles/work/models_dev_cache.json",
+      "home/tmp/nvda_spacex.html",
     ]) {
       expect(shouldInclude(p, patterns)).toBe(false);
     }
@@ -86,6 +101,8 @@ describe("hermesAdapter include/exclude/sqlite patterns", () => {
   it("still includes real per-profile state", () => {
     expect(shouldInclude("home/profiles/work/state.db", patterns)).toBe(true);
     expect(shouldInclude("home/profiles/work/memories/MEMORY.md", patterns)).toBe(true);
+    expect(shouldInclude("home/profiles/work/skills/my-skill/SKILL.md", patterns)).toBe(true);
+    expect(shouldInclude("home/profiles/work/models_dev_cache.json", patterns)).toBe(false);
   });
 
   it("flags state.db (incl. per-profile) as SQLite needing a safe snapshot", () => {

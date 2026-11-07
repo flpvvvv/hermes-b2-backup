@@ -65,6 +65,21 @@ export const hermesAdapter: BackupAdapter = {
     // profile (`profiles/<name>/…`), so per-profile copies are excluded too —
     // a top-level-only anchor would leak per-profile logs/node/checkpoints.
     /^home\/(?:profiles\/[^/]+\/)?(?:hermes-agent|node|cache|image_cache|logs|backups|state-snapshots|checkpoints)\//,
+    // Regeneratable per-platform toolchains and Hermes-managed binaries. These
+    // are downloaded on demand and a new versioned directory appears on every
+    // `hermes update`, so mirroring them multiplies upload size and makes the
+    // backup grow monotonically without preserving any state a restore needs.
+    // Note: the `node` entry above only matches a literal top-level `node/`;
+    // the real toolchains live under `tools/node-<version>-<platform>/`.
+    /^home\/(?:profiles\/[^/]+\/)?(?:tools|lsp|bin)\//,
+    // uv-managed virtualenvs and package-manager runtimes, under a per-install id
+    // (`installs/<id>/environments|pm-runtime|bootstrap`).
+    /^home\/(?:profiles\/[^/]+\/)?installs\/[^/]+\/(?:environments|pm-runtime|bootstrap)\//,
+    // Model metadata caches — regenerated on demand and rewritten often enough
+    // to churn the manifest on every run.
+    /^home\/(?:profiles\/[^/]+\/)?(?:models_dev_cache|provider_models_cache)\.json$/,
+    // Scratch space for one-off agent output (dumped HTML, temp downloads).
+    /^home\/tmp\//,
     // Caches/deps that can appear at any depth.
     /(^|\/)node_modules\//,
     /(^|\/)\.venv\//,
