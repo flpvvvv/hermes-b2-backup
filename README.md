@@ -1,108 +1,149 @@
 # hermes-b2-backup
 
-**Encrypted, incremental, off-site backups for your AI coding agent — powered by [Backblaze B2 cloud storage](https://blze.ai/storage).**
+**Encrypted, versioned, off-site snapshots of your Hermes Agent state to [Backblaze B2](https://www.backblaze.com/cloud-storage).**
 
-Incremental, **encrypted, offsite** backup of your [Hermes Agent](https://github.com/NousResearch/hermes-agent) state — sessions, memory, skills, config, and secrets — to [Backblaze B2](https://www.backblaze.com/cloud-storage).
+Each run creates one filtered `hermes backup` zip, encrypts it client-side, uploads it to B2, and keeps the newest N snapshots. Retention deletes B2 file **versions**, not just the visible object — so old copies stop being billed.
 
-Built on [`@backblaze-labs/agent-backup-core`](https://github.com/backblaze-labs/agent-backup-core).
+## Why one archive instead of a per-file mirror
 
-## How this differs from `hermes backup`
+The previous engine mirrored every file and used B2 server-side `CopyObject` to carry unchanged files into each new snapshot. That makes every snapshot self-contained, but B2 bills each `CopyObject` as a Class C transaction: ~1,800 copies per run, roughly the entire 2,500/day free-tier allowance. It also duplicated all data per snapshot.
 
-Hermes ships a built-in `hermes backup` / `hermes import` that writes a **local** full zip. This tool is complementary: it adds what the built-in doesn't —
+This version uploads one zip, so a run costs about **3 Class C transactions** (one authorize, one list, one version listing when pruning). Uploads and deletes are Class A; downloads are Class B.
 
-- **Incremental** — only changed files upload (SHA-256 diffing), not a fresh full zip every run.
-- **Offsite** — your backups land in B2, not next to the data they protect.
-- **Encrypted at rest** — AES-256-GCM. Hermes' `.env`, `auth.json`, and `state.db` are plaintext on disk; this keeps them encrypted in the cloud.
+The zip starts from Hermes' own `hermes backup` (full mode), which applies Hermes' maintained exclusion list and takes WAL-safe SQLite snapshots. It then rewrites the zip to strip the runtime trees Hermes still includes:
 
-It mirrors the live `~/.hermes` directly (WAL-safe SQLite snapshots) — it does not wrap `hermes backup`, so there's no dependency on the Hermes CLI and no full-zip overhead.
+- **Included:** config, `.env`, `auth.json`, `state.db` and profiles, sessions, skills (including archived skills), plugins, cron state, memories, and memory-provider state.
+- **Stripped after `hermes backup`:** `bin/`, `logs/`, `tmp/`, `cache/`, `tools/`, `lsp/`, `installs/*/environments`, `state-snapshots/`, `backups/`, `checkpoints/`, browser profiles, `node_modules`, virtualenvs, SQLite sidecars, and machine-local runtime files. That is roughly 182 MB raw → 144 MB filtered today.
+- `hermes backup --quick` is **not** used: it writes a local state snapshot, not a restorable zip.
 
-## Install & configure
+## Install and configure
 
 ```bash
 npm install -g @backblaze-labs/hermes-b2-backup
-export B2_KEY_ID=004... B2_APPLICATION_KEY=K004... B2_BUCKET=my-hermes-backups
-export B2_ENCRYPTION_KEY="a long random passphrase"   # see Security
 ```
 
-Or put these in `~/.config/hermes-b2-backup/config.json`. Optional: `B2_REGION`, `B2_PREFIX`, `B2_SCHEDULE`, `B2_KEEP_SNAPSHOTS`, `B2_ENCRYPT=false`, `HERMES_HOME`.
+Put credentials in `~/.config/hermes-b2-backup/config.json`:
 
-## Run
+```json
+{
+  "keyId": "003...",
+  "applicationKey": "K003...",
+  "bucket": "my-hermes-agent-backup",
+  "encryptionKey": "a long random passphrase",
+  "prefix": "hermes-flp",
+  "keepSnapshots": 7
+}
+```
+
+`chmod 600 ~/.config/hermes-b2-backup/config.json` — it holds both B2 and encryption keys. Environment variables `B2_KEY_ID`, `B2_APPLICATION_KEY`, `B2_BUCKET`, `B2_ENCRYPTION_KEY`, `B2_REGION`, `B2_PREFIX`, and `B2_KEEP_SNAPSHOTS` override the file.
+
+Optional keys:
+
+- `hermesBin` — absolute path to the Hermes CLI (default: `~/.local/bin/hermes`, else `hermes` from `PATH`).
+- `keepSnapshots` — complete snapshots to retain (default 7, minimum 1).
+
+## Commands
 
 ```bash
-hermes-b2-backup            # daemon: auto-restore on first run, then scheduled backups
-hermes-b2-backup --once     # single backup then exit
-hermes-b2-backup --install  # install an OS service (launchd / systemd / Task Scheduler)
+hermes-b2-backup                  # same as --once
+hermes-b2-backup --once           # create, encrypt, upload, prune
+hermes-b2-backup --list           # list snapshots and sizes
+hermes-b2-backup --restore        # newest snapshot → ./hermes-restore-<ts>/
+hermes-b2-backup --restore --to /tmp/hermes-restore --snapshot <ts>
+hermes-b2-backup --restore --import   # decrypt, verify, then `hermes import --force`
+hermes-b2-backup --purge-legacy --yes # delete pre-archives per-file snapshots
 ```
 
-## What gets backed up
+`--restore` extracts into a new directory by default; it never overwrites `~/.hermes` unless you explicitly pass `--import`. `--import` runs Hermes' own importer with `--force`.
 
-Mirrors `~/.hermes` (or `HERMES_HOME`; `%LOCALAPPDATA%\hermes` on Windows), plus external memory-provider stores (`~/.honcho`, `~/.hindsight`) when present:
+## How a run works
 
-- **Included:** `state.db` (WAL-safe snapshot — sessions + message history), `config.yaml`, `.env`, `auth.json`, `SOUL.md`, `memories/`, `skills/` (incl. `.archive/`), `plugins/`, `skins/`, `cron/jobs.json`, profiles, pairing data.
-- **Excluded:** the cloned `hermes-agent/` repo, `node/`/`node_modules`, virtualenvs, all caches, `logs/`, `backups/`/`state-snapshots/`/`checkpoints/`, SQLite `-wal`/`-shm` sidecars, and machine-local runtime files (`*.pid`, `gateway.lock`, `processes.json`, `gateway_state.json`) that would be harmful to restore onto another machine.
+1. Run `hermes backup -o <tmp>/hermes-raw.zip -k 0`. A nonzero exit aborts the run before upload and before pruning.
+2. Rewrite the zip without `bin/`, `logs/`, `tmp/`, caches, toolchains, and other regenerable trees; `state.db` must be present. A failed integrity check aborts the run.
+3. Split the filtered zip into 32 MiB chunks and encrypt each with AES-256-GCM using `encryptionKey` (scrypt-derived key, random salt/IV per chunk).
+4. Upload `data-NNN.enc` chunks, then `manifest.enc` last. A snapshot without a manifest is incomplete and is never restored or counted for retention.
+5. List `<prefix>/archives/`, keep the newest `keepSnapshots` complete snapshots, and permanently delete every version of older snapshots. Incomplete uploads older than 24 hours are also removed.
+
+Bucket layout:
+
+```
+<bucket>/<prefix>/archives/<timestamp>/
+  data-000.enc
+  data-001.enc
+  manifest.enc
+```
+
+The manifest records the plaintext and ciphertext SHA-256 of every chunk plus the whole zip. Restore verifies all of them before extracting or importing.
+
+## B2 transaction cost
+
+At 7 snapshots of the current ~144 MB filtered archive:
+
+- About **3 Class C transactions/day** (authorize, list archives, list versions while pruning).
+- ~144 MB uploaded per night (Class A, free).
+- ~1.0 GB stored (first 10 GB free).
+- Uploads and deletes are Class A; downloads are Class B.
+
+Class C counts are what the 2,500/day free-tier limit measures; the old ~1,800 `CopyObject` calls per run were the cause of the daily alerts.
+
+## Migrating from 0.3.x
+
+1. Stop the timer: `systemctl --user stop hermes-b2-backup.timer`.
+2. Run one `--once` and verify it with `--list` / `--restore --to /tmp/...`.
+3. Delete the old per-file snapshots once the archive restores correctly:
+   `hermes-b2-backup --purge-legacy --yes`
+   This keeps `<prefix>/archives/` and permanently removes every version under the old timestamp prefixes.
+4. Start the timer again.
+
+The old engine created B2 delete markers instead of deleting versions; `--purge-legacy` removes those hidden versions too.
+
+## Scheduling
+
+The CLI is a one-shot process. Example systemd user units:
+
+```ini
+# ~/.config/systemd/user/hermes-b2-backup.service
+[Unit]
+Description=Hermes archive backup to Backblaze B2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/you/.npm-global/bin/hermes-b2-backup --once
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle
+```
+
+```ini
+# ~/.config/systemd/user/hermes-b2-backup.timer
+[Unit]
+Description=Daily Hermes archive backup
+
+[Timer]
+OnCalendar=*-*-* 01:00:00 UTC
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+```
+
+A background service cannot read shell exports, so keep credentials in the config file.
 
 ## Security
 
-- **Set `B2_ENCRYPTION_KEY`** — separate from your B2 credentials. Hermes stores secrets (`.env`, `auth.json`) and full conversation history (`state.db`) in plaintext on disk; this tool **includes** them (you need them for a working restore) but encrypts the whole mirror at rest. Without `B2_ENCRYPTION_KEY` it falls back to the B2 key and warns.
+- The zip contains `.env`, `auth.json`, and full session history in plaintext before encryption. It is created in a private temp directory, chmod 600, and deleted after upload.
+- `encryptionKey` is separate from the B2 credentials: a leaked B2 key cannot decrypt the archive.
+- If `encryptionKey` is omitted, the engine falls back to deriving the key from the B2 application key and warns. Set a dedicated key.
 
-## FAQ
+## Requirements
 
-**How do I get Backblaze B2 credentials?**
-
-Create a free [Backblaze B2](https://blze.ai/storage) account, make a bucket, then create an Application Key. Use the keyID and applicationKey as `B2_KEY_ID` and `B2_APPLICATION_KEY`, and the bucket name as `B2_BUCKET`.
-
-**Is my data encrypted?**
-
-Yes — AES-256-GCM at rest. Set `B2_ENCRYPTION_KEY` to a long random passphrase. If you don't, it falls back to deriving a key from your B2 application key and prints a warning; setting a dedicated key means a leaked bucket credential can't decrypt your backups.
-
-**How often does it back up, and can I change the schedule?**
-
-By default it backs up immediately on start and then daily. Set `B2_SCHEDULE` to `daily`, `weekly`, or any cron expression.
-
-**Does it re-upload everything each time?**
-
-No. Backups are incremental — only files that changed since the last run are uploaded (SHA-256 diffing); unchanged files are carried forward server-side, so each snapshot still restores on its own.
-
-**How do I restore Hermes on a new machine?**
-
-Install and run `hermes-b2-backup` on the new machine. If local state is empty and snapshots exist in your bucket, it auto-restores the latest snapshot on first run. (You can also point it at a fresh bucket prefix to keep machines separate.)
-
-**How many snapshots are kept?**
-
-The 10 most recent by default; older ones are pruned. Change with `B2_KEEP_SNAPSHOTS`.
-
-**How do I run it automatically in the background?**
-
-`hermes-b2-backup --install` writes an OS service (launchd on macOS, systemd user unit on Linux, Task Scheduler on Windows). Because a background service can't see your shell's exported variables, put your credentials in `~/.config/hermes-b2-backup/config.json` (chmod 600) before activating it.
-
-**Can I back up several machines to one bucket?**
-
-Yes — give each machine a distinct `B2_PREFIX` so their snapshots don't mix.
-
-**How do I check it's actually working?**
-
-Run `hermes-b2-backup --once` and watch the output; it logs what it uploaded and the snapshot id. You can also browse the bucket in the B2 web UI.
-
-**How much does this cost?**
-
-Only your Backblaze B2 storage, which is priced per GB-month — see [blze.ai/storage](https://blze.ai/storage). The tool itself is free and open source (MIT).
-
-**Hermes already has `hermes backup` — why use this?**
-
-`hermes backup` writes a local zip. This tool is complementary: it adds incremental, **off-site**, **encrypted** backups to B2 — so a lost or compromised machine doesn't take your backups with it.
-
-**Are my profiles and memory providers included?**
-
-Yes — everything under `~/.hermes` (including `profiles/`) is mirrored, plus external memory-provider stores like `~/.honcho` when present.
-
-**Are my secrets backed up?**
-
-Yes — `.env` and `auth.json` are included because they're needed for a working restore, and the whole mirror is encrypted at rest. Set `B2_ENCRYPTION_KEY`.
-
-## Learn more
-
-- [Backblaze B2 Cloud Storage](https://blze.ai/storage) — affordable, S3-compatible object storage
-- [agent-backup-core](https://github.com/backblaze-labs/agent-backup-core) — the shared backup engine powering this tool
+- Node.js >= 22.5
+- The `hermes` CLI (absolute path recommended; `hermesBin` config or `HERMES_BIN`)
+- `python3` for zip integrity checks and safe extraction
+- `HERMES_HOME` is honored, so non-default homes and tests work.
 
 ## License
 

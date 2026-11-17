@@ -1,7 +1,7 @@
 {
   "name": "@backblaze-labs/hermes-b2-backup",
-  "version": "0.3.0",
-  "description": "Back up your Hermes Agent (NousResearch/hermes-agent) state \u2014 sessions, memory, skills, config, and secrets \u2014 to Backblaze B2: incremental, encrypted, WAL-safe.",
+  "version": "0.4.0",
+  "description": "Encrypted, versioned, off-site snapshots of Hermes Agent state to Backblaze B2.",
   "type": "module",
   "main": "dist/index.mjs",
   "types": "dist/index.d.mts",
